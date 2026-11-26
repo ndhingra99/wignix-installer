@@ -1,0 +1,1829 @@
+#!/bin/bash
+#-
+# Copyright (c) 2012-2015 Juan Romero Pardines <xtraeme@gmail.com>.
+#               2012 Dave Elusive <davehome@redthumb.info.tm>.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+# OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+# IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+# NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+# THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#-
+
+# Make sure we don't inherit these from env.
+HOSTNAME_DONE=
+KEYBOARD_DONE=
+LOCALE_DONE=
+TIMEZONE_DONE=
+ROOTPASSWORD_DONE=
+USERLOGIN_DONE=
+USERPASSWORD_DONE=
+USERNAME_DONE=
+USERGROUPS_DONE=
+USERACCOUNT_DONE=
+BOOTLOADER_DONE=
+PARTITIONS_DONE=
+FILESYSTEMS_DONE=
+ENCRYPTION_DONE=
+LUKS_PASS=
+
+TARGETDIR=/mnt/target
+LOG=/dev/tty8
+CONF_FILE=/tmp/.wignix-installer.conf
+if [ ! -f $CONF_FILE ]; then
+    touch -f $CONF_FILE
+fi
+ANSWER=$(mktemp -t vinstall-XXXXXXXX || exit 1)
+TARGET_SERVICES=$(mktemp -t vinstall-sv-XXXXXXXX || exit 1)
+TARGET_FSTAB=$(mktemp -t vinstall-fstab-XXXXXXXX || exit 1)
+
+trap "DIE" INT TERM QUIT
+
+# disable printk
+if [ -w /proc/sys/kernel/printk ]; then
+    echo 0 >/proc/sys/kernel/printk
+fi
+
+# Detect if this is an EFI system.
+if [ -e /sys/firmware/efi/systab ]; then
+    EFI_SYSTEM=1
+    EFI_FW_BITS=$(cat /sys/firmware/efi/fw_platform_size)
+    if [ $EFI_FW_BITS -eq 32 ]; then
+        EFI_TARGET=i386-efi
+    else
+        EFI_TARGET=x86_64-efi
+    fi
+    case "$(cat /sys/class/dmi/id/product_name 2>/dev/null)" in
+        Mac*) MAC_SYSTEM=1;;
+    esac
+fi
+
+# dialog colors
+BLACK="\Z0"
+RED="\Z1"
+GREEN="\Z2"
+YELLOW="\Z3"
+BLUE="\Z4"
+MAGENTA="\Z5"
+CYAN="\Z6"
+WHITE="\Z7"
+BOLD="\Zb"
+REVERSE="\Zr"
+UNDERLINE="\Zu"
+RESET="\Zn"
+
+# Properties shared per widget.
+MENULABEL="${BOLD}Use UP and DOWN keys to navigate \
+menus. Use TAB to switch between buttons and ENTER to select.${RESET}"
+MENUSIZE="14 60 0"
+INPUTSIZE="8 60"
+MSGBOXSIZE="8 70"
+YESNOSIZE="$INPUTSIZE"
+WIDGET_SIZE="10 70"
+
+DIALOG() {
+    rm -f $ANSWER
+    dialog --colors --keep-tite --no-shadow --no-mouse \
+        --backtitle "${BOLD}${WHITE}WigNix Installation${RESET}" \
+        --ok-label "Next" --cancel-label "Back" --aspect 20 "$@" 2>$ANSWER
+    return $?
+}
+
+INFOBOX() {
+    # Note: dialog --infobox and --keep-tite don't work together
+    dialog --colors --no-shadow --no-mouse \
+        --backtitle "${BOLD}${WHITE}WigNix Installation${RESET}" \
+        --title "${TITLE}" --aspect 20 --infobox "$@"
+}
+
+DIE() {
+    rval=$1
+    [ -z "$rval" ] && rval=0
+    clear
+    rm -f $ANSWER $TARGET_FSTAB $TARGET_SERVICES
+    # reenable printk
+    if [ -w /proc/sys/kernel/printk ]; then
+        echo 4 >/proc/sys/kernel/printk
+    fi
+    umount_filesystems
+    exit $rval
+}
+
+set_option() {
+    if grep -Eq "^${1} .*" $CONF_FILE; then
+        sed -i -e "/^${1} .*/d" $CONF_FILE
+    fi
+    echo "${1} ${2}" >>$CONF_FILE
+}
+
+get_option() {
+    grep -E "^${1} .*" $CONF_FILE | sed -e "s|^${1} ||"
+}
+
+# ISO-639 language names for locales
+iso639_language() {
+    case "$1" in
+    aa)  echo "Afar" ;;
+    af)  echo "Afrikaans" ;;
+    an)  echo "Aragonese" ;;
+    ar)  echo "Arabic" ;;
+    ast) echo "Asturian" ;;
+    be)  echo "Belarusian" ;;
+    bg)  echo "Bulgarian" ;;
+    bhb) echo "Bhili" ;;
+    br)  echo "Breton" ;;
+    bs)  echo "Bosnian" ;;
+    ca)  echo "Catalan" ;;
+    cs)  echo "Czech" ;;
+    cy)  echo "Welsh" ;;
+    da)  echo "Danish" ;;
+    de)  echo "German" ;;
+    el)  echo "Greek" ;;
+    en)  echo "English" ;;
+    es)  echo "Spanish" ;;
+    et)  echo "Estonian" ;;
+    eu)  echo "Basque" ;;
+    fi)  echo "Finnish" ;;
+    fo)  echo "Faroese" ;;
+    fr)  echo "French" ;;
+    ga)  echo "Irish" ;;
+    gd)  echo "Scottish Gaelic" ;;
+    gl)  echo "Galician" ;;
+    gv)  echo "Manx" ;;
+    he)  echo "Hebrew" ;;
+    hr)  echo "Croatian" ;;
+    hsb) echo "Upper Sorbian" ;;
+    hu)  echo "Hungarian" ;;
+    id)  echo "Indonesian" ;;
+    is)  echo "Icelandic" ;;
+    it)  echo "Italian" ;;
+    iw)  echo "Hebrew" ;;
+    ja)  echo "Japanese" ;;
+    ka)  echo "Georgian" ;;
+    kk)  echo "Kazakh" ;;
+    kl)  echo "Kalaallisut" ;;
+    ko)  echo "Korean" ;;
+    ku)  echo "Kurdish" ;;
+    kw)  echo "Cornish" ;;
+    lg)  echo "Ganda" ;;
+    lt)  echo "Lithuanian" ;;
+    lv)  echo "Latvian" ;;
+    mg)  echo "Malagasy" ;;
+    mi)  echo "Maori" ;;
+    mk)  echo "Macedonian" ;;
+    ms)  echo "Malay" ;;
+    mt)  echo "Maltese" ;;
+    nb)  echo "Norwegian Bokmål" ;;
+    nl)  echo "Dutch" ;;
+    nn)  echo "Norwegian Nynorsk" ;;
+    oc)  echo "Occitan" ;;
+    om)  echo "Oromo" ;;
+    pl)  echo "Polish" ;;
+    pt)  echo "Portuguese" ;;
+    ro)  echo "Romanian" ;;
+    ru)  echo "Russian" ;;
+    sk)  echo "Slovak" ;;
+    sl)  echo "Slovenian" ;;
+    so)  echo "Somali" ;;
+    sq)  echo "Albanian" ;;
+    st)  echo "Southern Sotho" ;;
+    sv)  echo "Swedish" ;;
+    tcy) echo "Tulu" ;;
+    tg)  echo "Tajik" ;;
+    th)  echo "Thai" ;;
+    tl)  echo "Tagalog" ;;
+    tr)  echo "Turkish" ;;
+    uk)  echo "Ukrainian" ;;
+    uz)  echo "Uzbek" ;;
+    wa)  echo "Walloon" ;;
+    xh)  echo "Xhosa" ;;
+    yi)  echo "Yiddish" ;;
+    zh)  echo "Chinese" ;;
+    zu)  echo "Zulu" ;;
+    *)   echo "$1" ;;
+    esac
+}
+
+# ISO-3166 country codes for locales
+iso3166_country() {
+    case "$1" in
+    AD) echo "Andorra" ;;
+    AE) echo "United Arab Emirates" ;;
+    AL) echo "Albania" ;;
+    AR) echo "Argentina" ;;
+    AT) echo "Austria" ;;
+    AU) echo "Australia" ;;
+    BA) echo "Bosnia and Herzegovina" ;;
+    BE) echo "Belgium" ;;
+    BG) echo "Bulgaria" ;;
+    BH) echo "Bahrain" ;;
+    BO) echo "Bolivia" ;;
+    BR) echo "Brazil" ;;
+    BW) echo "Botswana" ;;
+    BY) echo "Belarus" ;;
+    CA) echo "Canada" ;;
+    CH) echo "Switzerland" ;;
+    CL) echo "Chile" ;;
+    CN) echo "China" ;;
+    CO) echo "Colombia" ;;
+    CR) echo "Costa Rica" ;;
+    CY) echo "Cyprus" ;;
+    CZ) echo "Czech Republic" ;;
+    DE) echo "Germany" ;;
+    DJ) echo "Djibouti" ;;
+    DK) echo "Denmark" ;;
+    DO) echo "Dominican Republic" ;;
+    DZ) echo "Algeria" ;;
+    EC) echo "Ecuador" ;;
+    EE) echo "Estonia" ;;
+    EG) echo "Egypt" ;;
+    ES) echo "Spain" ;;
+    FI) echo "Finland" ;;
+    FO) echo "Faroe Islands" ;;
+    FR) echo "France" ;;
+    GB) echo "Great Britain" ;;
+    GE) echo "Georgia" ;;
+    GL) echo "Greenland" ;;
+    GR) echo "Greece" ;;
+    GT) echo "Guatemala" ;;
+    HK) echo "Hong Kong" ;;
+    HN) echo "Honduras" ;;
+    HR) echo "Croatia" ;;
+    HU) echo "Hungary" ;;
+    ID) echo "Indonesia" ;;
+    IE) echo "Ireland" ;;
+    IL) echo "Israel" ;;
+    IN) echo "India" ;;
+    IQ) echo "Iraq" ;;
+    IS) echo "Iceland" ;;
+    IT) echo "Italy" ;;
+    JO) echo "Jordan" ;;
+    JP) echo "Japan" ;;
+    KE) echo "Kenya" ;;
+    KR) echo "Korea, Republic of" ;;
+    KW) echo "Kuwait" ;;
+    KZ) echo "Kazakhstan" ;;
+    LB) echo "Lebanon" ;;
+    LT) echo "Lithuania" ;;
+    LU) echo "Luxembourg" ;;
+    LV) echo "Latvia" ;;
+    LY) echo "Libya" ;;
+    MA) echo "Morocco" ;;
+    MG) echo "Madagascar" ;;
+    MK) echo "Macedonia" ;;
+    MT) echo "Malta" ;;
+    MX) echo "Mexico" ;;
+    MY) echo "Malaysia" ;;
+    NI) echo "Nicaragua" ;;
+    NL) echo "Netherlands" ;;
+    NO) echo "Norway" ;;
+    NZ) echo "New Zealand" ;;
+    OM) echo "Oman" ;;
+    PA) echo "Panama" ;;
+    PE) echo "Peru" ;;
+    PH) echo "Philippines" ;;
+    PL) echo "Poland" ;;
+    PR) echo "Puerto Rico" ;;
+    PT) echo "Portugal" ;;
+    PY) echo "Paraguay" ;;
+    QA) echo "Qatar" ;;
+    RO) echo "Romania" ;;
+    RU) echo "Russian Federation" ;;
+    SA) echo "Saudi Arabia" ;;
+    SD) echo "Sudan" ;;
+    SE) echo "Sweden" ;;
+    SG) echo "Singapore" ;;
+    SI) echo "Slovenia" ;;
+    SK) echo "Slovakia" ;;
+    SO) echo "Somalia" ;;
+    SV) echo "El Salvador" ;;
+    SY) echo "Syria" ;;
+    TH) echo "Thailand" ;;
+    TJ) echo "Tajikistan" ;;
+    TN) echo "Tunisia" ;;
+    TR) echo "Turkey" ;;
+    TW) echo "Taiwan" ;;
+    UA) echo "Ukraine" ;;
+    UG) echo "Uganda" ;;
+    US) echo "United States of America" ;;
+    UY) echo "Uruguay" ;;
+    UZ) echo "Uzbekistan" ;;
+    VE) echo "Venezuela" ;;
+    YE) echo "Yemen" ;;
+    ZA) echo "South Africa" ;;
+    ZW) echo "Zimbabwe" ;;
+    *)  echo "$1" ;;
+    esac
+}
+
+show_disks() {
+    local dev size sectorsize gbytes
+
+    # IDE
+    for dev in $(ls /sys/block|grep -E '^hd'); do
+        if [ "$(cat /sys/block/$dev/device/media)" = "disk" ]; then
+            # Find out nr sectors and bytes per sector;
+            echo "/dev/$dev"
+            size=$(cat /sys/block/$dev/size)
+            sectorsize=$(cat /sys/block/$dev/queue/hw_sector_size)
+            gbytes="$(($size * $sectorsize / 1024 / 1024 / 1024))"
+            echo "size:${gbytes}GB;sector_size:$sectorsize"
+        fi
+    done
+    # SATA/SCSI and Virtual disks (virtio)
+    for dev in $(ls /sys/block|grep -E '^([sv]|xv)d|mmcblk|nvme'); do
+        echo "/dev/$dev"
+        size=$(cat /sys/block/$dev/size)
+        sectorsize=$(cat /sys/block/$dev/queue/hw_sector_size)
+        gbytes="$(($size * $sectorsize / 1024 / 1024 / 1024))"
+        echo "size:${gbytes}GB;sector_size:$sectorsize"
+    done
+    # cciss(4) devices
+    for dev in $(ls /dev/cciss 2>/dev/null|grep -E 'c[0-9]d[0-9]$'); do
+        echo "/dev/cciss/$dev"
+        size=$(cat /sys/block/cciss\!$dev/size)
+        sectorsize=$(cat /sys/block/cciss\!$dev/queue/hw_sector_size)
+        gbytes="$(($size * $sectorsize / 1024 / 1024 / 1024))"
+        echo "size:${gbytes}GB;sector_size:$sectorsize"
+    done
+}
+
+get_partfs() {
+    # Get fs type from configuration if available. This ensures
+    # that the user is shown the proper fs type if they install the system.
+    local part="$1"
+    local default="${2:-none}"
+    local fstype=$(grep "MOUNTPOINT ${part} " "$CONF_FILE"|awk '{print $3}')
+    echo "${fstype:-$default}"
+}
+
+show_partitions() {
+    local dev fstype fssize p part
+
+    set -- $(show_disks)
+    while [ $# -ne 0 ]; do
+        disk=$(basename $1)
+        shift 2
+        # ATA/SCSI/SATA
+        for p in /sys/block/$disk/$disk*; do
+            if [ -d $p ]; then
+                part=$(basename $p)
+                fstype=$(lsblk -nfr /dev/$part|awk '{print $2}'|head -1)
+                [ "$fstype" = "iso9660" ] && continue
+                [ "$fstype" = "LVM2_member" ] && continue
+                fssize=$(lsblk -nr /dev/$part|awk '{print $4}'|head -1)
+                echo "/dev/$part"
+                echo "size:${fssize:-unknown};fstype:$(get_partfs "/dev/$part")"
+            fi
+        done
+    done
+    # Device Mapper
+    for p in /dev/mapper/*; do
+        part=$(basename $p)
+        [ "${part}" = "live-rw" ] && continue
+        [ "${part}" = "live-base" ] && continue
+        [ "${part}" = "control" ] && continue
+
+        fstype=$(lsblk -nfr $p|awk '{print $2}'|head -1)
+        fssize=$(lsblk -nr $p|awk '{print $4}'|head -1)
+        echo "${p}"
+        echo "size:${fssize:-unknown};fstype:$(get_partfs "$p")"
+    done
+    # Software raid (md)
+    for p in $(ls -d /dev/md* 2>/dev/null|grep '[0-9]'); do
+        part=$(basename $p)
+        if cat /proc/mdstat|grep -qw $part; then
+            fstype=$(lsblk -nfr /dev/$part|awk '{print $2}')
+            [ "$fstype" = "LVM2_member" ] && continue
+            fssize=$(lsblk -nr /dev/$part|awk '{print $4}')
+            echo "$p"
+            echo "size:${fssize:-unknown};fstype:$(get_partfs "$p")"
+        fi
+    done
+    # cciss(4) devices
+    for part in $(ls /dev/cciss 2>/dev/null|grep -E 'c[0-9]d[0-9]p[0-9]+'); do
+        fstype=$(lsblk -nfr /dev/cciss/$part|awk '{print $2}')
+        [ "$fstype" = "LVM2_member" ] && continue
+        fssize=$(lsblk -nr /dev/cciss/$part|awk '{print $4}')
+        echo "/dev/cciss/$part"
+        echo "size:${fssize:-unknown};fstype:$(get_partfs "/dev/cciss/$part")"
+    done
+    if [ -e /sbin/lvs ]; then
+        # LVM
+        lvs --noheadings|while read lvname vgname perms size; do
+            echo "/dev/mapper/${vgname}-${lvname}"
+            echo "size:${size};fstype:$(get_partfs "/dev/mapper/${vgname}-${lvname}" lvm)"
+        done
+    fi
+}
+
+menu_filesystems() {
+    local dev fstype fssize mntpoint reformat
+
+    while true; do
+        DIALOG --ok-label "Change" --cancel-label "Done" \
+            --title " Select the partition to edit " --menu "$MENULABEL" \
+            ${MENUSIZE} $(show_partitions)
+        # Done (the second button) completes the step; Escape goes back.
+        case $? in
+            0) ;;
+            1) FILESYSTEMS_DONE=1; return 0 ;;
+            *) return 1 ;;
+        esac
+
+        dev=$(cat $ANSWER)
+        DIALOG --title " Select the filesystem type for $dev " \
+            --menu "$MENULABEL" ${MENUSIZE} \
+            "ext2" "Linux ext2 (no journaling)" \
+            "ext3" "Linux ext3 (journal)" \
+            "ext4" "Linux ext4 (journal)" \
+            "swap" "Linux swap" \
+            "vfat" "FAT32" \
+            "xfs" "SGI XFS"
+        if [ $? -eq 0 ]; then
+            fstype=$(cat $ANSWER)
+        else
+            continue
+        fi
+        if [ "$fstype" != "swap" ]; then
+            DIALOG --inputbox "Please specify the mount point for $dev:" ${INPUTSIZE}
+            if [ $? -eq 0 ]; then
+                mntpoint=$(cat $ANSWER)
+            elif [ $? -eq 1 ]; then
+                continue
+            fi
+        else
+            mntpoint=swap
+        fi
+        DIALOG --yesno "Do you want to create a new filesystem on $dev?" ${YESNOSIZE}
+        if [ $? -eq 0 ]; then
+            reformat=1
+        elif [ $? -eq 1 ]; then
+            reformat=0
+        else
+            continue
+        fi
+        fssize=$(lsblk -nr $dev|awk '{print $4}')
+        set -- "$fstype" "$fssize" "$mntpoint" "$reformat"
+        if [ -n "$1" -a -n "$2" -a -n "$3" -a -n "$4" ]; then
+            local bdev=$(basename $dev)
+            local ddev=$(basename $(dirname $dev))
+            if [ "$ddev" != "dev" ]; then
+                sed -i -e "/^MOUNTPOINT \/dev\/${ddev}\/${bdev} .*/d" $CONF_FILE
+            else
+                sed -i -e "/^MOUNTPOINT \/dev\/${bdev} .*/d" $CONF_FILE
+            fi
+            echo "MOUNTPOINT $dev $1 $2 $3 $4" >>$CONF_FILE
+        fi
+    done
+    FILESYSTEMS_DONE=1
+}
+
+menu_partitions() {
+    local device software
+    # Done completes the step; the disks may already be laid out as needed.
+    # Each disk partitioned comes back to this list.
+    while true; do
+        DIALOG --title " Select the disk to partition " --extra-button --extra-label "Done" \
+            --menu "$MENULABEL" ${MENUSIZE} $(show_disks)
+        case $? in
+            3) PARTITIONS_DONE=1; return 0 ;;
+            0) ;;
+            *) return 1 ;;
+        esac
+        device=$(cat $ANSWER)
+        DIALOG --title " Select the software for partitioning " \
+            --menu "$MENULABEL" ${MENUSIZE} \
+            "cfdisk" "Easy to use" \
+            "fdisk" "More advanced"
+        [ $? -eq 0 ] || continue
+        software=$(cat $ANSWER)
+        DIALOG --title "Modify Partition Table on $device" --msgbox "\n
+${BOLD}${software} will be executed in disk $device.${RESET}\n\n
+For BIOS systems, MBR or GPT partition tables are supported. To use GPT\n
+on PC BIOS systems, an empty partition of 1MB must be added at the first\n
+2GB of the disk with the partition type \`BIOS Boot'.\n
+${BOLD}NOTE: you don't need this on EFI systems.${RESET}\n\n
+For EFI systems, GPT is mandatory and a FAT32 partition with at least 100MB\n
+must be created with the partition type \`EFI System'. This will be used as\n
+the EFI System Partition. This partition must have the mountpoint \`/boot/efi'.\n\n
+With LUKS, or on a Mac, a separate ext4 partition of at least 512MB is required\n
+for \`/boot'. It stays unencrypted so the firmware and GRUB can reach it.\n\n
+At least 1 partition is required for the rootfs (/). For this partition,\n
+at least 2GB is required, but more is recommended. The rootfs partition\n
+should have the partition type \`Linux Filesystem'. For swap, RAM*2\n
+should be enough and the partition type \`Linux swap' should be used.\n\n
+${BOLD}WARNING: /usr is not supported as a separate partition.${RESET}\n
+${RESET}\n" 26 80
+        [ $? -eq 0 ] || continue
+        clear; $software $device
+    done
+}
+
+menu_keymap() {
+    local _keymap
+    while true; do
+        DIALOG --title " Select your keymap " --menu "$MENULABEL" 14 70 6 \
+            "American" "us" \
+            "British" "uk" \
+            "German" "de" \
+            "Japanese" "jp106" \
+            "Chinese" "us" \
+            "Russian" "ru"
+        if [ $? -eq 0 ]; then
+            case "$(cat $ANSWER)" in
+                American|Chinese) _keymap=us ;;
+                British) _keymap=uk ;;
+                German) _keymap=de ;;
+                Japanese) _keymap=jp106 ;;
+                Russian) _keymap=ru ;;
+            esac
+            set_option KEYMAP "$_keymap"
+            loadkeys "$_keymap"
+            KEYBOARD_DONE=1
+            break
+        else
+            return
+        fi
+    done
+}
+
+set_keymap() {
+    local KEYMAP=$(get_option KEYMAP)
+
+    if [ -f /etc/vconsole.conf ]; then
+        sed -i -e "s|KEYMAP=.*|KEYMAP=$KEYMAP|g" $TARGETDIR/etc/vconsole.conf
+    else
+        sed -i -e "s|#\?KEYMAP=.*|KEYMAP=$KEYMAP|g" $TARGETDIR/etc/rc.conf
+    fi
+}
+
+menu_locale() {
+    while true; do
+        DIALOG --title " Select your locale " --menu "$MENULABEL" 15 70 7 \
+            "en_US.UTF-8" "USA" \
+            "ja_JP.UTF-8" "Japan" \
+            "zh_CN.UTF-8" "China" \
+            "de_DE.UTF-8" "Germany" \
+            "en_GB.UTF-8" "Britain" \
+            "en_NZ.UTF-8" "New Zealand" \
+            "ru_RU.UTF-8" "Russia"
+        if [ $? -eq 0 ]; then
+            set_option LOCALE "$(cat $ANSWER)"
+            LOCALE_DONE=1
+            break
+        else
+            return
+        fi
+    done
+}
+
+set_locale() {
+    if [ -f $TARGETDIR/etc/default/libc-locales ]; then
+        local LOCALE="$(get_option LOCALE)"
+        : "${LOCALE:=C.UTF-8}"
+        sed -i -e "s|LANG=.*|LANG=$LOCALE|g" $TARGETDIR/etc/locale.conf
+        # Uncomment locale from /etc/default/libc-locales and regenerate it.
+        sed -e "/${LOCALE}/s/^\#//" -i $TARGETDIR/etc/default/libc-locales
+        echo "Running xbps-reconfigure -f glibc-locales ..." >$LOG
+        chroot $TARGETDIR xbps-reconfigure -f glibc-locales >$LOG 2>&1
+    fi
+}
+
+menu_timezone() {
+    local areas=(America Antarctica Arctic Asia Atlantic Australia Europe Indian Pacific)
+
+    local area locations location
+    while (IFS='|'; DIALOG ${area:+--default-item|"$area"} --title " Select area " --menu "$MENULABEL" 19 51 19 $(printf '%s|' "US Pacific" "America/Los_Angeles") $(printf '%s||' "${areas[@]}")); do
+        area=$(cat $ANSWER)
+        if [ "$area" = "US Pacific" ]; then
+            set_option TIMEZONE "America/Los_Angeles"
+            TIMEZONE_DONE=1
+            return 0
+        fi
+        read -a locations -d '\n' < <(find /usr/share/zoneinfo/$area -type f -printf '%P\n' | sort)
+        if (IFS='|'; DIALOG --title " Select location (${area}) " --menu "$MENULABEL" 19 51 19 $(printf '%s||' "${locations[@]//_/ }")); then
+            location=$(tr ' ' '_' < $ANSWER)
+            set_option TIMEZONE "$area/$location"
+            TIMEZONE_DONE=1
+            return 0
+        else
+            continue
+        fi
+    done
+    return 1
+}
+
+set_timezone() {
+    local TIMEZONE="$(get_option TIMEZONE)"
+
+    ln -sf "/usr/share/zoneinfo/${TIMEZONE}" "${TARGETDIR}/etc/localtime"
+}
+
+menu_hostname() {
+    local _preset
+    while true; do
+        _preset=$(get_option HOSTNAME)
+        [ -z "$_preset" ] && _preset="wignix"
+        DIALOG --inputbox "Name your computer:" ${INPUTSIZE} "$_preset"
+        if [ $? -eq 0 ]; then
+            set_option HOSTNAME "$(cat $ANSWER)"
+            HOSTNAME_DONE=1
+            break
+        else
+            return
+        fi
+    done
+}
+
+set_hostname() {
+    local hostname="$(get_option HOSTNAME)"
+    echo "${hostname:-wignix}" > $TARGETDIR/etc/hostname
+}
+
+menu_rootpassword() {
+    local _firstpass _secondpass _again _desc
+
+    while true; do
+        if [ -z "${_firstpass}" ]; then
+            _desc="Enter the root password"
+        else
+            _again=" again"
+        fi
+        DIALOG --insecure --passwordbox "${_desc}${_again}" ${INPUTSIZE}
+        if [ $? -eq 0 ]; then
+            if [ -z "${_firstpass}" ]; then
+                _firstpass="$(cat $ANSWER)"
+            else
+                _secondpass="$(cat $ANSWER)"
+            fi
+            if [ -n "${_firstpass}" -a -n "${_secondpass}" ]; then
+                if [ "${_firstpass}" != "${_secondpass}" ]; then
+                    INFOBOX "Passwords do not match! Please enter again." 6 60
+                    unset _firstpass _secondpass _again
+                    sleep 2 && clear && continue
+                fi
+                set_option ROOTPASSWORD "${_firstpass}"
+                ROOTPASSWORD_DONE=1
+                break
+            fi
+        else
+            return
+        fi
+    done
+}
+
+set_rootpassword() {
+    echo "root:$(get_option ROOTPASSWORD)" | chroot $TARGETDIR chpasswd -c SHA512
+}
+
+menu_useraccount() {
+    local _firstpass _secondpass _desc _again
+    local _groups _status _group _checklist
+    local _preset _userlogin
+
+    while true; do
+        _preset=$(get_option USERLOGIN)
+        [ -z "$_preset" ] && _preset="wig"
+        DIALOG --inputbox "Enter a primary login name:" ${INPUTSIZE} "$_preset"
+        if [ $? -eq 0 ]; then
+            _userlogin="$(cat $ANSWER)"
+            # based on useradd(8) § Caveats
+            if [ "${#_userlogin}" -le 32 ] && [[ "${_userlogin}" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then
+                set_option USERLOGIN "${_userlogin}"
+                USERLOGIN_DONE=1
+                break
+            else
+                INFOBOX "Invalid login name! Please try again." 6 60
+                unset _userlogin
+                sleep 2 && clear && continue
+            fi
+        else
+            return
+        fi
+    done
+
+    while true; do
+        _preset=$(get_option USERNAME)
+        [ -z "$_preset" ] && _preset="WigNix User"
+        DIALOG --inputbox "Enter a display name for login '$(get_option USERLOGIN)' :" \
+            ${INPUTSIZE} "$_preset"
+        if [ $? -eq 0 ]; then
+            set_option USERNAME "$(cat $ANSWER)"
+            USERNAME_DONE=1
+            break
+        else
+            return
+        fi
+    done
+
+    while true; do
+        if [ -z "${_firstpass}" ]; then
+            _desc="Enter the password for login '$(get_option USERLOGIN)'"
+        else
+            _again=" again"
+        fi
+        DIALOG --insecure --passwordbox "${_desc}${_again}" ${INPUTSIZE}
+        if [ $? -eq 0 ]; then
+            if [ -z "${_firstpass}" ]; then
+                _firstpass="$(cat $ANSWER)"
+            else
+                _secondpass="$(cat $ANSWER)"
+            fi
+            if [ -n "${_firstpass}" -a -n "${_secondpass}" ]; then
+                if [ "${_firstpass}" != "${_secondpass}" ]; then
+                    INFOBOX "Passwords do not match! Please enter again." 6 60
+                    unset _firstpass _secondpass _again
+                    sleep 2 && clear && continue
+                fi
+                set_option USERPASSWORD "${_firstpass}"
+                USERPASSWORD_DONE=1
+                break
+            fi
+        else
+            return
+        fi
+    done
+
+    # Preselected: wheel for password sudo and wpa_supplicant control, storage for
+    # mounting drives and shares through udisks2, input/network/plugdev for the
+    # desktop, kvm and libvirt for virtual machines through virt-manager.
+    _groups="wheel,audio,video,input,storage,network,plugdev,floppy,cdrom,optical,kvm,libvirt,users,xbuilder"
+    while true; do
+        _desc="Select group membership for login '$(get_option USERLOGIN)':"
+        for _group in $(cat /etc/group); do
+            _gid="$(echo ${_group} | cut -d: -f3)"
+            _group="$(echo ${_group} | cut -d: -f1)"
+            _status="$(echo ${_groups} | grep -w ${_group})"
+            if [ -z "${_status}" ]; then
+                _status=off
+            else
+                _status=on
+            fi
+            # ignore the groups of root, existing users, and package groups
+            if [[ "${_gid}" -ge 1000 || "${_group}" = "_"* || "${_group}" =~ ^(root|nogroup|chrony|dbus|lightdm|polkitd)$ ]]; then
+                continue
+            fi
+            if [ -z "${_checklist}" ]; then
+                _checklist="${_group} ${_group}:${_gid} ${_status}"
+            else
+                _checklist="${_checklist} ${_group} ${_group}:${_gid} ${_status}"
+            fi
+        done
+        DIALOG --no-tags --checklist "${_desc}" 20 60 18 ${_checklist}
+        if [ $? -eq 0 ]; then
+            set_option USERGROUPS $(cat $ANSWER | sed -e's| |,|g')
+            USERGROUPS_DONE=1
+            break
+        else
+            return
+        fi
+    done
+}
+
+# Seeds the AIDE database for the installed system, keeps a pristine copy in
+# /boot and sets up the daily check whose report lands in the primary user's
+# home (root's when no user account was created).
+init_aide() {
+    local _total
+
+    [ -x $TARGETDIR/usr/bin/aide ] || return
+
+    mkdir -p $TARGETDIR/etc/cron.daily
+    cat > $TARGETDIR/etc/cron.daily/aide-report <<'EOF'
+#!/bin/sh
+# Daily AIDE check; the reports collect in root's ~/aide, readable by root only.
+_dir=/root/aide
+mkdir -p "$_dir"
+chmod 700 "$_dir"
+_out="$_dir/aide-report-$(date +%Y-%m-%d).txt"
+rm -f "$_out"
+set -C
+aide --check > "$_out" 2>&1
+chmod 600 "$_out"
+EOF
+    chmod 755 $TARGETDIR/etc/cron.daily/aide-report
+
+    INFOBOX "Counting the files AIDE will record ..." 4 70
+    _total=$(find $TARGETDIR/boot $TARGETDIR/etc $TARGETDIR/usr $TARGETDIR/opt \
+        $TARGETDIR/var/log -xdev 2>/dev/null | wc -l)
+    [ "$_total" -gt 0 ] || _total=1
+    echo "Initialising the AIDE database ..." >$LOG
+    # aide shows progress only on a terminal, so script lends it one; the file
+    # count drives the gauge and everything else goes to the log.
+    script -qefc "chroot $TARGETDIR aide --init" /dev/null 2>>$LOG |
+        tr '\r' '\n' |
+        awk -v total="$_total" -v logf="$LOG" '
+            /^\[[0-9]+:[0-9]+\] / {
+                if (/write db>/) { print 99; fflush(); next }
+                if (match($0, /> [0-9]+ file/)) {
+                    p = int(substr($0, RSTART + 2, RLENGTH - 7) * 100 / total)
+                    print (p > 99 ? 99 : p); fflush()
+                }
+                next
+            }
+            NF { print >> logf }' |
+        DIALOG --gauge "Initialising the AIDE integrity database ..." 7 70 0
+    if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+        DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} \
+AIDE could not build its database! check $LOG for errors." ${MSGBOXSIZE}
+        return
+    fi
+    mv $TARGETDIR/var/lib/aide/aide.db.new $TARGETDIR/var/lib/aide/aide.db
+    cp $TARGETDIR/var/lib/aide/aide.db $TARGETDIR/boot/aide.db.pristine
+}
+
+set_useraccount() {
+    [ -z "$USERACCOUNT_DONE" ] && return
+    chroot $TARGETDIR useradd -m -G "$(get_option USERGROUPS)" \
+        -c "$(get_option USERNAME)" "$(get_option USERLOGIN)"
+    echo "$(get_option USERLOGIN):$(get_option USERPASSWORD)" | \
+        chroot $TARGETDIR chpasswd -c SHA512
+}
+
+menu_bootloader() {
+    while true; do
+        DIALOG --title " Select the disk to install the bootloader" \
+            --menu "$MENULABEL" ${MENUSIZE} $(show_disks) none "Manage bootloader otherwise"
+        if [ $? -eq 0 ]; then
+            set_option BOOTLOADER "$(cat $ANSWER)"
+            BOOTLOADER_DONE=1
+            break
+        else
+            return
+        fi
+    done
+    while true; do
+        DIALOG --yesno "Use a graphical terminal for the boot loader?" ${YESNOSIZE}
+        if [ $? -eq 0 ]; then
+            set_option TEXTCONSOLE 0
+            break
+        elif [ $? -eq 1 ]; then
+            set_option TEXTCONSOLE 1
+            break
+        else
+            return
+        fi
+    done
+}
+
+set_bootloader() {
+    local dev=$(get_option BOOTLOADER) grub_args=
+
+    if [ "$dev" = "none" ]; then return; fi
+
+    # Check if it's an EFI system via efivars module.
+    if [ -n "$EFI_SYSTEM" ]; then
+        grub_args="--target=$EFI_TARGET --efi-directory=/boot/efi --bootloader-id=void_grub --recheck"
+        if [ -n "$MAC_SYSTEM" ]; then
+            grub_args="--target=$EFI_TARGET --efi-directory=/boot/efi --removable --no-nvram --recheck"
+        fi
+    else
+        grub_args="--target=i386-pc"
+    fi
+    echo "Running grub-install $grub_args $dev..." >$LOG
+    chroot $TARGETDIR grub-install $grub_args $dev >$LOG 2>&1
+    if [ $? -ne 0 ]; then
+        DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} \
+failed to install GRUB to $dev!\nCheck $LOG for errors." ${MSGBOXSIZE}
+        DIE 1
+    fi
+    echo "Running grub-mkconfig on $TARGETDIR..." >$LOG
+    chroot $TARGETDIR grub-mkconfig -o /boot/grub/grub.cfg >$LOG 2>&1
+    if [ $? -ne 0 ]; then
+        DIALOG --msgbox "${BOLD}${RED}ERROR${RESET}: \
+failed to run grub-mkconfig!\nCheck $LOG for errors." ${MSGBOXSIZE}
+        DIE 1
+    fi
+}
+
+validate_useraccount() {
+    # don't check that USERNAME has been set because it can be empty
+    local USERLOGIN=$(get_option USERLOGIN)
+    local USERPASSWORD=$(get_option USERPASSWORD)
+    local USERGROUPS=$(get_option USERGROUPS)
+
+    if [ -n "$USERLOGIN" ] && [ -n "$USERPASSWORD" ] && [ -n "$USERGROUPS" ]; then
+        USERACCOUNT_DONE=1
+    fi
+}
+
+validate_filesystems() {
+    local mnts dev size fstype mntpt mkfs rootfound fmt
+    local usrfound efi_system_partition bootfound bootfstype unformatted
+    local bootdev=$(get_option BOOTLOADER)
+
+    unset TARGETFS
+    mnts=$(grep -E '^MOUNTPOINT .*' $CONF_FILE)
+    set -- ${mnts}
+    while [ $# -ne 0 ]; do
+        fmt=""
+        dev=$2; fstype=$3; size=$4; mntpt="$5"; mkfs=$6
+        shift 6
+
+        if [ "$mntpt" = "/" ]; then
+            rootfound=1
+        elif [ "$mntpt" = "/usr" ]; then
+            usrfound=1
+        elif [ "$fstype" = "vfat" -a "$mntpt" = "/boot/efi" ]; then
+            efi_system_partition=1
+        elif [ "$mntpt" = "/boot" ]; then
+            bootfound=1
+            bootfstype=$fstype
+        fi
+        if [ "$mkfs" -eq 1 ]; then
+            fmt="NEW FILESYSTEM: "
+        fi
+        if [ -n "$LUKS_PASS" ]; then
+            case "$mntpt" in
+                /boot|/boot/efi) ;;
+                *)
+                    fmt="ENCRYPTED, ${fmt}"
+                    [ "$mkfs" -eq 1 ] || unformatted="$dev"
+                    ;;
+            esac
+        fi
+        if [ -z "$TARGETFS" ]; then
+            TARGETFS="${fmt}$dev ($size) mounted on $mntpt as ${fstype}\n"
+        else
+            TARGETFS="${TARGETFS}${fmt}${dev} ($size) mounted on $mntpt as ${fstype}\n"
+        fi
+    done
+    if [ -z "$rootfound" ]; then
+        DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} \
+the mount point for the root filesystem (/) has not yet been configured." ${MSGBOXSIZE}
+        return 1
+    elif [ -n "$usrfound" ]; then
+        DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} \
+/usr mount point has been configured but is not supported, please remove it to continue." ${MSGBOXSIZE}
+        return 1
+    elif [ -n "$EFI_SYSTEM" -a "$bootdev" != "none" -a -z "$efi_system_partition" ]; then
+        DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} \
+The EFI System Partition has not yet been configured, please create it\n
+as FAT32, mountpoint /boot/efi and at least with 100MB of size." ${MSGBOXSIZE}
+        return 1
+    elif [ -n "$LUKS_PASS" -a -n "$unformatted" ]; then
+        DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} \
+$unformatted would be encrypted, so it must be set to get a new filesystem." ${MSGBOXSIZE}
+        return 1
+    elif [ -n "$LUKS_PASS" -o -n "$MAC_SYSTEM" ] && [ -z "$bootfound" ]; then
+        DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} \
+Encryption (and Mac installs) need an unencrypted /boot partition: ext4, 512 MB or more, mount point /boot." ${MSGBOXSIZE}
+        return 1
+    elif [ -n "$bootfound" -a -n "$LUKS_PASS" ]; then
+        case "$bootfstype" in
+            ext2|ext3|ext4) ;;
+            *)
+                DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} \
+/boot must be ext2, ext3 or ext4 when the system is encrypted." ${MSGBOXSIZE}
+                return 1
+                ;;
+        esac
+    fi
+    # GPT on a BIOS system keeps GRUB's core image in a BIOS Boot partition.
+    if [ -z "$EFI_SYSTEM" -a "$bootdev" != "none" ] &&
+        [ "$(blkid -o value -s PTTYPE "$bootdev")" = "gpt" ] &&
+        ! lsblk -nro PARTTYPE "$bootdev" | grep -qi '^21686148-6449-6e6f-744e-656564454649$'; then
+        DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} \
+$bootdev is GPT on a BIOS system, so it needs a 1MB partition of type BIOS Boot.\n
+Add one under Partition, or use an MBR partition table." ${MSGBOXSIZE}
+        return 1
+    fi
+    FILESYSTEMS_DONE=1
+}
+
+menu_encryption() {
+    local _first _second
+
+    # Any earlier answer is dropped: only a completed run of this step encrypts.
+    LUKS_PASS=
+    DIALOG --yesno "Encrypt every file system except /boot on your installation?\n\n
+Each one, swap included, is reformatted as LUKS2 with a new file system inside.\n
+/boot stays unencrypted so GRUB can start the system. It must be a separate\n
+ext2, ext3 or ext4 partition of 512 MB or more.\n
+The passphrase is asked for once at each boot." 12 78
+    case $? in
+        0) ;;
+        1) LUKS_PASS=; ENCRYPTION_DONE=1; return 0 ;;
+        *) return 1 ;;
+    esac
+    while true; do
+        DIALOG --insecure --passwordbox "Enter the disk encryption passphrase (8 characters or more)" ${INPUTSIZE} || { rm -f $ANSWER; return; }
+        _first="$(cat $ANSWER)"
+        DIALOG --insecure --passwordbox "Enter the disk encryption passphrase again" ${INPUTSIZE} || { rm -f $ANSWER; return; }
+        _second="$(cat $ANSWER)"
+        rm -f $ANSWER
+        if [ "${#_first}" -lt 8 ]; then
+            DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} the passphrase is too short." ${MSGBOXSIZE}
+        elif [ "$_first" != "$_second" ]; then
+            DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} the passphrases do not match." ${MSGBOXSIZE}
+        else
+            LUKS_PASS="$_first"
+            ENCRYPTION_DONE=1
+            return
+        fi
+    done
+}
+
+# AES-XTS on CPUs with AES instructions. Without them Adiantum is several times faster.
+luks_cipher_args() {
+    if grep -qw aes /proc/cpuinfo; then
+        echo "--cipher aes-xts-plain64 --key-size 512 --hash sha512"
+    else
+        echo "--cipher xchacha12,aes-adiantum-plain64 --key-size 256 --hash sha512"
+    fi
+}
+
+setup_luks() {
+    local mnts dev fstype mntpt uuid name
+
+    [ -n "$LUKS_PASS" ] || return 0
+    mnts=$(grep -E '^MOUNTPOINT .*' $CONF_FILE)
+    set -- ${mnts}
+    while [ $# -ne 0 ]; do
+        dev=$2; fstype=$3; mntpt="$5"
+        shift 6
+        case "$mntpt" in
+            /boot|/boot/efi) continue;;
+        esac
+        case "$dev" in
+            /dev/mapper/luks-*) continue;;
+        esac
+        INFOBOX "Encrypting $dev for $mntpt ..." 4 60
+        echo "Running cryptsetup luksFormat on $dev..." >$LOG
+        printf '%s' "$LUKS_PASS" | cryptsetup luksFormat --batch-mode --type luks2 \
+            --pbkdf argon2id $(luks_cipher_args) --key-file=- "$dev" >$LOG 2>&1
+        if [ $? -ne 0 ]; then
+            DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} \
+failed to encrypt ${dev}!\ncheck $LOG for errors." ${MSGBOXSIZE}
+            DIE 1
+        fi
+        uuid=$(cryptsetup luksUUID "$dev")
+        name="luks-$uuid"
+        printf '%s' "$LUKS_PASS" | cryptsetup open --key-file=- "$dev" "$name" >$LOG 2>&1
+        if [ $? -ne 0 ]; then
+            DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} \
+failed to open ${dev}!\ncheck $LOG for errors." ${MSGBOXSIZE}
+            DIE 1
+        fi
+        sed -i -e "s|^MOUNTPOINT $dev |MOUNTPOINT /dev/mapper/$name |" $CONF_FILE
+        echo "LUKSMAP $name $uuid $mntpt" >>$CONF_FILE
+    done
+}
+
+# The root volume unlocks from the passphrase in the initramfs. The others unlock from
+# key files kept on the encrypted root, so the passphrase is asked for only once.
+configure_luks_target() {
+    local maps name uuid mntpt key root_uuid keymap args= kver
+
+    [ -n "$LUKS_PASS" ] || return 0
+    INFOBOX "Configuring encrypted boot ..." 4 60
+    install -d -m 700 $TARGETDIR/etc/cryptkeys
+    maps=$(grep -E '^LUKSMAP .*' $CONF_FILE)
+    set -- ${maps}
+    while [ $# -ne 0 ]; do
+        name=$2; uuid=$3; mntpt="$4"
+        shift 4
+        if [ "$mntpt" = "/" ]; then
+            root_uuid=$uuid
+            continue
+        fi
+        key=/etc/cryptkeys/$name.key
+        dd if=/dev/urandom of=$TARGETDIR$key bs=512 count=8 >$LOG 2>&1
+        chmod 400 $TARGETDIR$key
+        printf '%s' "$LUKS_PASS" | cryptsetup luksAddKey --key-file=- \
+            "/dev/disk/by-uuid/$uuid" $TARGETDIR$key >$LOG 2>&1
+        if [ $? -ne 0 ]; then
+            DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} \
+failed to add a key file to ${name}!\ncheck $LOG for errors." ${MSGBOXSIZE}
+            DIE 1
+        fi
+        echo "$name UUID=$uuid $key luks" >>$TARGETDIR/etc/crypttab
+    done
+
+    mkdir -p $TARGETDIR/etc/dracut.conf.d
+    echo 'add_dracutmodules+=" crypt i18n "' >$TARGETDIR/etc/dracut.conf.d/10-luks.conf
+
+    args="rd.luks.uuid=$root_uuid"
+    keymap="$(get_option KEYMAP)"
+    [ -n "$keymap" ] && args="$args rd.vconsole.keymap=$keymap"
+    sed -i -e "s|^GRUB_CMDLINE_LINUX_DEFAULT=\"|&$args |" $TARGETDIR/etc/default/grub
+    if ! grep -q "rd.luks.uuid=$root_uuid" $TARGETDIR/etc/default/grub; then
+        echo "GRUB_CMDLINE_LINUX_DEFAULT=\"$args\"" >>$TARGETDIR/etc/default/grub
+    fi
+
+    for kver in $(ls $TARGETDIR/usr/lib/modules); do
+        # Out-of-tree module packages may leave a directory for a kernel that
+        # is not installed; only kernels with an image get an initramfs.
+        [ -f $TARGETDIR/boot/vmlinuz-$kver ] || continue
+        echo "Rebuilding initramfs for $kver ..." >$LOG
+        chroot $TARGETDIR dracut --force --no-hostonly --add-drivers "ahci" \
+            "/boot/initramfs-$kver.img" "$kver" >>$LOG 2>&1
+        if [ $? -ne 0 ]; then
+            DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} \
+failed to build the initramfs for ${kver}!\ncheck $LOG for errors." ${MSGBOXSIZE}
+            DIE 1
+        fi
+    done
+    LUKS_PASS=
+}
+
+create_filesystems() {
+    local mnts dev mntpt fstype fspassno mkfs size rv uuid
+
+    # truncate to avoid doubling up
+    : >"$TARGET_FSTAB"
+
+    setup_luks
+
+    mnts=$(grep -E '^MOUNTPOINT .*' $CONF_FILE | sort -k 5)
+    set -- ${mnts}
+    while [ $# -ne 0 ]; do
+        dev=$2; fstype=$3; mntpt="$5"; mkfs=$6
+        shift 6
+
+        # swap partitions
+        if [ "$fstype" = "swap" ]; then
+            swapoff $dev >/dev/null 2>&1
+            if [ "$mkfs" -eq 1 ]; then
+                wipefs -a -q $dev >$LOG 2>&1
+                mkswap $dev >$LOG 2>&1
+                if [ $? -ne 0 ]; then
+                    DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} \
+failed to create swap on ${dev}!\ncheck $LOG for errors." ${MSGBOXSIZE}
+                    DIE 1
+                fi
+            fi
+            swapon $dev >$LOG 2>&1
+            if [ $? -ne 0 ]; then
+                DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} \
+failed to activate swap on $dev!\ncheck $LOG for errors." ${MSGBOXSIZE}
+                DIE 1
+            fi
+            # Add entry for target fstab
+            uuid=$(blkid -o value -s UUID "$dev")
+            echo "UUID=$uuid none swap defaults 0 0" >>$TARGET_FSTAB
+            continue
+        fi
+
+        if [ "$mkfs" -eq 1 ]; then
+            case "$fstype" in
+            btrfs) MKFS="mkfs.btrfs -f"; modprobe btrfs >$LOG 2>&1;;
+            ext2) MKFS="mke2fs -F"; modprobe ext2 >$LOG 2>&1;;
+            ext3) MKFS="mke2fs -F -j"; modprobe ext3 >$LOG 2>&1;;
+            ext4) MKFS="mke2fs -F -t ext4"; modprobe ext4 >$LOG 2>&1;;
+            f2fs) MKFS="mkfs.f2fs -f"; modprobe f2fs >$LOG 2>&1;;
+            vfat) MKFS="mkfs.vfat -F32"; modprobe vfat >$LOG 2>&1;;
+            xfs) MKFS="mkfs.xfs -f -i sparse=0"; modprobe xfs >$LOG 2>&1;;
+            esac
+            TITLE="Check $LOG for details ..."
+            INFOBOX "Creating filesystem $fstype on $dev for $mntpt ..." 8 60
+            # Old signatures (a LUKS header from an earlier install) would
+            # otherwise survive next to the new filesystem.
+            wipefs -a -q $dev >$LOG 2>&1
+            echo "Running $MKFS $dev..." >$LOG
+            $MKFS $dev >$LOG 2>&1; rv=$?
+            if [ $rv -ne 0 ]; then
+                DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} \
+failed to create filesystem $fstype on $dev!\ncheck $LOG for errors." ${MSGBOXSIZE}
+                DIE 1
+            fi
+        fi
+        # Mount rootfs the first one.
+        [ "$mntpt" != "/" ] && continue
+        mkdir -p $TARGETDIR
+        echo "Mounting $dev on $mntpt ($fstype)..." >$LOG
+        mount -t $fstype $dev $TARGETDIR >$LOG 2>&1
+        if [ $? -ne 0 ]; then
+            DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} \
+failed to mount $dev on ${mntpt}! check $LOG for errors." ${MSGBOXSIZE}
+            DIE 1
+        fi
+        # Add entry to target fstab
+        uuid=$(blkid -o value -s UUID "$dev")
+        if [ "$fstype" = "f2fs" -o "$fstype" = "btrfs" -o "$fstype" = "xfs" ]; then
+            fspassno=0
+        else
+            fspassno=1
+        fi
+        echo "UUID=$uuid $mntpt $fstype defaults 0 $fspassno" >>$TARGET_FSTAB
+    done
+
+    # mount all filesystems in target rootfs
+    mnts=$(grep -E '^MOUNTPOINT .*' $CONF_FILE | sort -k 5)
+    set -- ${mnts}
+    while [ $# -ne 0 ]; do
+        dev=$2; fstype=$3; mntpt="$5"
+        shift 6
+        [ "$mntpt" = "/" -o "$fstype" = "swap" ] && continue
+        mkdir -p ${TARGETDIR}${mntpt}
+        echo "Mounting $dev on $mntpt ($fstype)..." >$LOG
+        mount -t $fstype $dev ${TARGETDIR}${mntpt} >$LOG 2>&1
+        if [ $? -ne 0 ]; then
+            DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} \
+failed to mount $dev on $mntpt! check $LOG for errors." ${MSGBOXSIZE}
+            DIE
+        fi
+        # Add entry to target fstab
+        uuid=$(blkid -o value -s UUID "$dev")
+        if [ "$fstype" = "f2fs" -o "$fstype" = "btrfs" -o "$fstype" = "xfs" ]; then
+            fspassno=0
+        else
+            fspassno=2
+        fi
+        # A separate /home carries the user-data restrictions directly.
+        if [ "$mntpt" = "/home" ]; then
+            fsopts="defaults,nosuid,nodev"
+        else
+            fsopts="defaults"
+        fi
+        echo "UUID=$uuid $mntpt $fstype $fsopts 0 $fspassno" >>$TARGET_FSTAB
+    done
+}
+
+mount_filesystems() {
+    for f in sys proc dev; do
+        [ ! -d $TARGETDIR/$f ] && mkdir $TARGETDIR/$f
+        echo "Mounting $TARGETDIR/$f..." >$LOG
+        mount --rbind /$f $TARGETDIR/$f >$LOG 2>&1
+    done
+}
+
+umount_filesystems() {
+    local mnts="$(grep -E '^MOUNTPOINT .* swap .*$' $CONF_FILE | sort -r -k 5)"
+    set -- ${mnts}
+    while [ $# -ne 0 ]; do
+        local dev=$2; local fstype=$3
+        shift 6
+        if [ "$fstype" = "swap" ]; then
+            echo "Disabling swap space on $dev..." >$LOG
+            swapoff $dev >$LOG 2>&1
+            continue
+        fi
+    done
+    echo "Unmounting $TARGETDIR..." >$LOG
+    umount -R $TARGETDIR >$LOG 2>&1
+}
+
+log_and_count() {
+    local progress whole tenth
+    while read line; do
+        echo "$line" >$LOG
+        copy_count=$((copy_count + 1))
+        progress=$((1000 * copy_count / copy_total))
+        if [ "$progress" != "$copy_progress" ]; then
+            whole=$((progress / 10))
+            tenth=$((progress % 10))
+            printf "Progress: %d.%d%% (%d of %d files)\n" $whole $tenth $copy_count $copy_total
+            copy_progress=$progress
+        fi
+    done
+}
+
+copy_rootfs() {
+    local tar_in="--create --one-file-system --xattrs"
+    TITLE="Check $LOG for details ..."
+    INFOBOX "Counting files, please be patient ..." 4 60
+    copy_total=$(tar ${tar_in} -v -f /dev/null / 2>/dev/null | wc -l)
+    export copy_total copy_count=0 copy_progress=
+    clear
+    tar ${tar_in} -f - / 2>/dev/null | \
+        tar --extract --xattrs --xattrs-include='*' --preserve-permissions -v -f - -C $TARGETDIR | \
+        log_and_count | \
+        DIALOG --title "${TITLE}" \
+            --progressbox "Copying live image to target rootfs." 5 60
+    if [ $? -ne 0 ]; then
+        DIE 1
+    fi
+    unset copy_total copy_count copy_percent
+}
+
+# The live image already holds the whole package set; the disc repository
+# carries what was kept out of it. Install all of that too, except the
+# per-machine packages, which install_machine_package picks by hardware.
+install_disc_repo() {
+    local _repo=/run/initramfs/live/repo _f= _pkgs=
+    [ -d $_repo ] || return 0
+    for _f in $_repo/*.xbps; do
+        # An empty repository (nothing dropped from the rootfs) leaves the
+        # pattern itself; a RAM boot has no disc at all.
+        [ -f "$_f" ] || continue
+        _f=${_f##*/}
+        _f=${_f%.*.xbps}
+        case "$_f" in *-modifications-*) continue ;; esac
+        _pkgs="$_pkgs $(xbps-uhelper getpkgname "$_f")"
+    done
+    _pkgs=$(echo $_pkgs)
+    [ -n "$_pkgs" ] || return 0
+    echo "Installing the disc repository: $_pkgs" >$LOG
+    stdbuf -oL xbps-install -r $TARGETDIR --repository=$_repo -y $_pkgs 2>&1 | \
+        DIALOG --title "Installing the remaining packages from the disc..." \
+        --programbox 24 80
+    if [ ${PIPESTATUS[0]} -ne 0 ]; then
+        DIALOG --msgbox "${BOLD}${RED}WARNING:${RESET} not every package on the disc \
+could be installed. Check $LOG." ${MSGBOXSIZE}
+    fi
+}
+
+install_machine_package() {
+    local _pkg= _repo=
+    case "$(cat /sys/class/dmi/id/product_version /sys/class/dmi/id/product_name 2>/dev/null)" in
+        *"ThinkPad T60"*) _pkg=t60-modifications ;;
+        *"ThinkPad W520"*) _pkg=w520-modifications ;;
+        *"MacPro6,1"*) _pkg=macpro2013-modifications ;;
+    esac
+    # Mac Pro 6,1 without a usable DMI string: Apple SMC present and a Xeon E5 v2.
+    if [ -z "$_pkg" ] && [ -d /sys/devices/platform/applesmc.768 ] &&
+       grep -qE 'Xeon.*E5-[0-9]{4} v2' /proc/cpuinfo; then
+        _pkg=macpro2013-modifications
+    fi
+    # Kernel lockdown (integrity) everywhere but the Mac Pro, whose boot-time
+    # BD_PROCHOT fix needs MSR writes.
+    if [ "$_pkg" != macpro2013-modifications ] && [ -f $TARGETDIR/etc/default/grub ]; then
+        sed -i -e 's|^GRUB_CMDLINE_LINUX_DEFAULT="|&lockdown=integrity |' $TARGETDIR/etc/default/grub
+    fi
+    # The copied rootfs carries the machine-package repository; the installed
+    # system has no use for it.
+    rm -rf $TARGETDIR/usr/share/wignix/repo
+    [ -n "$_pkg" ] || return 0
+    # The machine packages ride inside the live rootfs (a RAM boot has no disc
+    # left to read); the disc repository is added when it is still mounted.
+    _repo="--repository=/usr/share/wignix/repo"
+    if [ -d /run/initramfs/live/repo ]; then
+        _repo="$_repo --repository=/run/initramfs/live/repo"
+    fi
+    INFOBOX "Installing $_pkg ..." 4 60
+    echo "Installing $_pkg ..." >$LOG
+    if ! xbps-install -r $TARGETDIR $_repo -y "$_pkg" >>$LOG 2>&1; then
+        DIALOG --msgbox "${BOLD}${RED}WARNING:${RESET} could not install $_pkg.\n
+Check $LOG, and install it after the first boot." ${MSGBOXSIZE}
+    fi
+}
+
+install_b43_firmware() {
+    local _dev= _found=
+    [ -d $TARGETDIR/usr/lib/firmware/b43 ] && return 0
+    command -v b43-firmware-install >/dev/null || return 0
+    for _dev in /sys/bus/pci/devices/*; do
+        if grep -q 0x14e4 "$_dev/vendor" 2>/dev/null && grep -q '^0x0280' "$_dev/class" 2>/dev/null; then
+            _found=1
+        fi
+    done
+    [ -n "$_found" ] || return 0
+    # The disc installs without a network; the firmware is only on a disc that
+    # carries the b43-firmware package (then the rootfs copy already has it).
+    DIALOG --msgbox "${BOLD}${RED}WARNING:${RESET} this disc has no Broadcom b43 Wi-Fi firmware.\n
+Connect to Ethernet and run b43-firmware-install after the first boot." ${MSGBOXSIZE}
+}
+
+# Mac Pro 6,1: DMI string, or (when DMI is useless) Apple SMC plus a Xeon E5 v2.
+is_macpro2013() {
+    case "$(cat /sys/class/dmi/id/product_name 2>/dev/null)" in
+        *MacPro6,1*) return 0 ;;
+    esac
+    [ -d /sys/devices/platform/applesmc.768 ] &&
+        grep -qE 'Xeon.*E5-[0-9]{4} v2' /proc/cpuinfo
+}
+
+# Five-minute memtest_vulkan run per FirePro, one GPU at a time, with the die
+# temperature watched; 90 C stops the run and means the thermal paste is due.
+# memtest_vulkan labels discrete GPUs 1..N ordered by descending PCI bus, so the
+# label for each sysfs device follows from the same ordering.
+menu_gputest() {
+    local _dev _devs _label=1 _hwmon _temp _max _start _elapsed _pid _status _report=
+    local _log=/tmp/gputest.log _limit=330
+    if ! command -v memtest_vulkan >/dev/null; then
+        DIALOG --msgbox "memtest_vulkan is not on this disc." ${MSGBOXSIZE}
+        return
+    fi
+    _devs=$(for _dev in /sys/bus/pci/devices/*; do
+        grep -q '^0x1002$' $_dev/vendor 2>/dev/null && grep -q '^0x03' $_dev/class 2>/dev/null &&
+            echo "${_dev##*/}"
+    done | sort -t: -k2,2r)
+    if [ -z "$_devs" ]; then
+        DIALOG --msgbox "No AMD GPU is bound to amdgpu on this machine." ${MSGBOXSIZE}
+        return
+    fi
+    DIALOG --yesno "${BOLD}Mac Pro GPU memory test${RESET}\n\n
+Each GPU is tested for five minutes with memtest_vulkan, one at a time, while its \
+temperature is watched. A GPU that reaches 90 C stops its test.\n\n
+${BOLD}Start the test?${RESET}" 12 70 || return
+    for _dev in $_devs; do
+        _hwmon=$(ls -d /sys/bus/pci/devices/$_dev/hwmon/hwmon* 2>/dev/null | head -1)
+        _status=pass
+        _max=0
+        : > $_log
+        timeout -s INT $_limit memtest_vulkan $_label >$_log 2>&1 &
+        _pid=$!
+        _start=$(date +%s)
+        while kill -0 $_pid 2>/dev/null; do
+            sleep 2
+            _elapsed=$(( $(date +%s) - _start ))
+            _temp=$(cat $_hwmon/temp1_input 2>/dev/null || echo 0)
+            _temp=$(( _temp / 1000 ))
+            [ $_temp -gt $_max ] && _max=$_temp
+            if [ $_temp -ge 90 ]; then
+                kill -INT $_pid 2>/dev/null
+                _status=hot
+                break
+            fi
+            DIALOG --infobox "Testing GPU $_label ($_dev): ${_elapsed}s of 300s, ${_temp} C (max ${_max} C)" 5 70
+        done
+        wait $_pid 2>/dev/null
+        if [ $_status = pass ]; then
+            grep -q 'Error found' $_log && _status=fail
+            grep -q 'Runtime error' $_log && _status=abort
+        fi
+        case $_status in
+            pass) _report+="GPU $_label ($_dev): no errors in five minutes, max ${_max} C\n" ;;
+            fail) _report+="GPU $_label ($_dev): MEMORY ERRORS FOUND, this GPU is bad (max ${_max} C)\n" ;;
+            abort) _report+="GPU $_label ($_dev): the driver lost the device mid-test, treat this GPU as bad\n" ;;
+            hot) _report+="GPU $_label ($_dev): reached 90 C after ${_elapsed}s, test stopped. \
+Service the thermal paste on this GPU before relying on it.\n" ;;
+        esac
+        _label=$((_label + 1))
+    done
+    DIALOG --msgbox "${BOLD}GPU test results${RESET}\n\n${_report}\nFull output: $_log" 16 76
+}
+
+menu_services() {
+    local sv _status _checklist=""
+    # filter out services that probably shouldn't be messed with
+    local sv_ignore='^(agetty-(tty[1-9]|generic|serial|console)|udevd|sulogin)$'
+    find $TARGETDIR/etc/runit/runsvdir/default -mindepth 1 -maxdepth 1 -xtype d -printf '%f\n' | \
+        grep -Ev "$sv_ignore" | sort -u > "$TARGET_SERVICES"
+    while true; do
+        while read -r sv; do
+            if [ -n "$sv" ]; then
+                if grep -qx "$sv" "$TARGET_SERVICES" 2>/dev/null; then
+                    _status=on
+                else
+                    _status=off
+                fi
+                _checklist+=" ${sv} ${sv} ${_status}"
+            fi
+        done < <(find $TARGETDIR/etc/sv -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | grep -Ev "$sv_ignore" | sort -u)
+        DIALOG --no-tags --checklist "Select services to enable:" 20 60 18 ${_checklist}
+        if [ $? -eq 0 ]; then
+            comm -13 "$TARGET_SERVICES" <(cat "$ANSWER" | tr ' ' '\n') | while read -r sv; do
+                enable_service "$sv"
+            done
+            comm -23 "$TARGET_SERVICES" <(cat "$ANSWER" | tr ' ' '\n') | while read -r sv; do
+                disable_service "$sv"
+            done
+            break
+        else
+            return
+        fi
+    done
+}
+
+enable_service() {
+    ln -sf "/etc/sv/$1" "$TARGETDIR/etc/runit/runsvdir/default/$1"
+}
+
+disable_service() {
+    rm -f "$TARGETDIR/etc/runit/runsvdir/default/$1"
+}
+
+menu_install() {
+    ROOTPASSWORD_DONE="$(get_option ROOTPASSWORD)"
+    BOOTLOADER_DONE="$(get_option BOOTLOADER)"
+
+    if [ -z "$ROOTPASSWORD_DONE" ]; then
+        DIALOG --msgbox "${BOLD}The root password has not been configured, \
+please do so before starting the installation.${RESET}" ${MSGBOXSIZE}
+        return 1
+    elif [ -z "$BOOTLOADER_DONE" ]; then
+        DIALOG --msgbox "${BOLD}The disk to install the bootloader has not been \
+configured, please do so before starting the installation.${RESET}" ${MSGBOXSIZE}
+        return 1
+    fi
+
+    # Validate filesystems after making sure bootloader is done,
+    # so that specific checks can be made based on the selection
+    validate_filesystems || return 1
+
+    if [ -z "$FILESYSTEMS_DONE" ]; then
+        DIALOG --msgbox "${BOLD}Required filesystems were not configured, \
+please do so before starting the installation.${RESET}" ${MSGBOXSIZE}
+        return 1
+    fi
+
+    # Validate useraccount. All parameters must be set (name, password, login name, groups).
+    validate_useraccount
+
+    if [ -z "$USERACCOUNT_DONE" ]; then
+        DIALOG --yesno "${BOLD}The user account is not set up properly.${RESET}\n\n
+${BOLD}${RED}WARNING: no user will be created. You will only be able to login \
+with the root user in your new system.${RESET}\n\n
+${BOLD}Do you want to continue?${RESET}" 10 60 || return
+    fi
+
+    DIALOG --yesno "${BOLD}The following operations will be executed:${RESET}\n\n
+${BOLD}${TARGETFS}${RESET}\n
+${BOLD}${RED}WARNING: data on partitions will be COMPLETELY DESTROYED for new \
+filesystems.${RESET}\n\n
+${BOLD}Do you want to continue?${RESET}" 20 80 || return
+    unset TARGETFS
+
+    # Create and mount filesystems
+    create_filesystems
+
+    # check if there are any files in the root partition, ignoring lost+found
+    if find "$TARGETDIR" -xdev -not -name 'lost+found' -not -type d | read; then
+        DIALOG --msgbox "${BOLD}${RED}ERROR:${RESET} \
+Root partition not empty! Aborting..." ${MSGBOXSIZE}
+        DIE 1
+    fi
+
+    # The disc is the only source: copy the live image, then add the disc repository.
+    copy_rootfs
+    . /etc/default/live.conf
+    rm -f $TARGETDIR/etc/motd
+    rm -f $TARGETDIR/etc/issue
+    # Remove modified sddm.conf to let sddm use the defaults.
+    rm -f $TARGETDIR/etc/sddm.conf
+    # Remove live user.
+    echo "Removing $USERNAME live user from targetdir ..." >$LOG
+    chroot $TARGETDIR userdel -r $USERNAME >$LOG 2>&1
+    rm -f $TARGETDIR/etc/sudoers.d/99-void-live
+    sed -i "s,GETTY_ARGS=\"--noclear -a $USERNAME\",GETTY_ARGS=\"--noclear\",g" $TARGETDIR/etc/sv/agetty-tty1/conf
+    # The live disc starts X from this hook for the live user, with a session
+    # file that opens the installer (the headless disc prints the addresses
+    # instead); the installed system logs in through slim or on the console.
+    rm -f $TARGETDIR/etc/profile.d/zz-live-x.sh $TARGETDIR/etc/X11/xinit/xinitrc.live
+    TITLE="Check $LOG for details ..."
+    INFOBOX "Rebuilding initramfs for target ..." 4 60
+    echo "Rebuilding initramfs for target ..." >$LOG
+    # mount required fs
+    mount_filesystems
+    chroot $TARGETDIR dracut --no-hostonly --add-drivers "ahci" --force >>$LOG 2>&1
+    INFOBOX "Removing temporary packages from target ..." 4 60
+    echo "Removing temporary packages from target ..." >$LOG
+    TO_REMOVE="wignix-installer dialog"
+    # only remove espeakup and brltty if it wasn't enabled in the live environment
+    if ! [ -e "/var/service/espeakup" ]; then
+        TO_REMOVE+=" espeakup"
+    fi
+    if ! [ -e "/var/service/brltty" ]; then
+        TO_REMOVE+=" brltty"
+    fi
+    if [ "$(get_option BOOTLOADER)" = none ]; then
+        TO_REMOVE+=" grub-x86_64-efi grub-i386-efi grub"
+    fi
+    # uninstall separately to minimise errors
+    for pkg in $TO_REMOVE; do
+        xbps-remove -r $TARGETDIR -Ry "$pkg" >>$LOG 2>&1
+    done
+    rmdir $TARGETDIR/mnt/target
+    install_disc_repo
+
+    INFOBOX "Applying installer settings..." 4 60
+
+    # copy target fstab.
+    install -Dm644 $TARGET_FSTAB $TARGETDIR/etc/fstab
+    # Mount /tmp as tmpfs.
+    echo "tmpfs /tmp tmpfs defaults,noexec,nosuid,nodev 0 0" >> $TARGETDIR/etc/fstab
+    # /var/tmp stays on its filesystem; a bind mount onto itself applies the
+    # same restrictions. /home gets nosuid,nodev the same way unless it is a
+    # separate filesystem, whose fstab entry already carries them.
+    echo "/var/tmp /var/tmp none bind,noexec,nosuid,nodev 0 0" >> $TARGETDIR/etc/fstab
+    if ! awk '$1 == "MOUNTPOINT" && $5 == "/home" { f = 1 } END { exit !f }' $CONF_FILE; then
+        echo "/home /home none bind,nosuid,nodev 0 0" >> $TARGETDIR/etc/fstab
+    fi
+    # runit mounts /dev/shm before fstab is read, so the restrictions go on at
+    # the end of stage 1 through rc.local.
+    echo "mount -o remount,noexec,nosuid,nodev /dev/shm" >> $TARGETDIR/etc/rc.local
+
+
+    # set up keymap, locale, timezone, hostname, root passwd and user account.
+    set_keymap
+    set_locale
+    set_timezone
+    set_hostname
+    set_rootpassword
+    set_useraccount
+    install_machine_package
+    install_b43_firmware
+
+    # Copy /etc/skel files for root.
+    cp $TARGETDIR/etc/skel/.[bix]* $TARGETDIR/root
+
+    # Networking on the installed system: dhcpcd on every interface, and the
+    # Wi-Fi networks set up on the live desktop carried over with wpa_supplicant.
+    enable_service dhcpcd
+    if ls /sys/class/net/wl* >/dev/null 2>&1 && [ -s /etc/wpa_supplicant/wpa_supplicant.conf ]; then
+        cp /etc/wpa_supplicant/wpa_supplicant.conf $TARGETDIR/etc/wpa_supplicant
+        enable_service wpa_supplicant
+    fi
+
+    # zram swap is on by default on this fork; the services menu can still turn it off.
+    if [ -d $TARGETDIR/etc/sv/zramen ]; then
+        enable_service zramen
+    fi
+    # tlp power management runs only on laptops: a battery is fitted.
+    if [ -d $TARGETDIR/etc/sv/tlp ] && grep -qs '^POWER_SUPPLY_PRESENT=1' /sys/class/power_supply/BAT[01]/uevent; then
+        enable_service tlp
+    fi
+    # The headless disc installs a server: no display manager, sshd enabled
+    # (the firewall rules it copies already pass port 22), and the disc's
+    # password-login drop-in and marker left behind. The desktop disc installs
+    # the graphical login.
+    if [ -f /etc/wignix-headless ]; then
+        enable_service sshd
+        rm -f $TARGETDIR/etc/wignix-headless $TARGETDIR/etc/ssh/sshd_config.d/10-wignix-live.conf
+    elif [ -d $TARGETDIR/etc/sv/slim ]; then
+        enable_service slim
+    fi
+    # cron runs the daily AIDE report written by init_aide.
+    if [ -d $TARGETDIR/etc/sv/cronie ]; then
+        enable_service cronie
+    fi
+
+    if [ -d $TARGETDIR/etc/sudoers.d ]; then
+        USERLOGIN="$(get_option USERLOGIN)"
+        if [ -z "$(echo $(get_option USERGROUPS) | grep -w wheel)" -a -n "$USERLOGIN" ]; then
+            # enable sudo for primary user USERLOGIN who is not member of wheel
+            echo "# Enable sudo for login '$USERLOGIN'" > "$TARGETDIR/etc/sudoers.d/$USERLOGIN"
+            echo "$USERLOGIN ALL=(ALL:ALL) ALL" >> "$TARGETDIR/etc/sudoers.d/$USERLOGIN"
+        else
+            # enable the sudoers entry for members of group wheel
+            echo "%wheel ALL=(ALL:ALL) ALL" > "$TARGETDIR/etc/sudoers.d/wheel"
+        fi
+        unset USERLOGIN
+    fi
+
+    # clean up polkit rule - it's only useful in live systems
+    rm -f $TARGETDIR/etc/polkit-1/rules.d/void-live.rules
+
+    # enable text console for grub if chosen
+    if [ "$(get_option TEXTCONSOLE)" = "1" ]; then
+        sed -i $TARGETDIR/etc/default/grub \
+            -e 's|#\(GRUB_TERMINAL_INPUT\).*|\1=console|' \
+            -e 's|#\(GRUB_TERMINAL_OUTPUT\).*|\1=console|'
+    fi
+
+    configure_luks_target
+
+    # install bootloader.
+    set_bootloader
+
+    # menu for enabling services
+    menu_services
+
+    # Last step: the integrity database must describe the finished system.
+    init_aide
+
+    sync && sync && sync
+
+    # unmount all filesystems.
+    umount_filesystems
+
+    # installed successfully.
+    INSTALL_DONE=1
+    DIALOG --yes-label "Reboot" --no-label "Exit" --yesno "${BOLD}WigNix has been installed successfully!${RESET}\n
+Do you want to reboot the system?" ${YESNOSIZE}
+    if [ $? -eq 0 ]; then
+        shutdown -r now
+    else
+        return
+    fi
+}
+
+# One step after another, each with Next and Back; a step is left only once
+# it is complete. Back on the first step offers to abort.
+STEPS=(Keyboard Hostname Locale Timezone RootPassword UserAccount BootLoader Partition Filesystems Encryption Install)
+
+step_done() {
+    case "$1" in
+        Keyboard) [ -n "$KEYBOARD_DONE" ] ;;
+        Hostname) [ -n "$HOSTNAME_DONE" ] ;;
+        Locale) [ -n "$LOCALE_DONE" ] ;;
+        Timezone) [ -n "$TIMEZONE_DONE" ] ;;
+        RootPassword) [ -n "$ROOTPASSWORD_DONE" ] ;;
+        UserAccount) [ -n "$USERLOGIN_DONE" ] && [ -n "$USERPASSWORD_DONE" ] && [ -n "$USERGROUPS_DONE" ] ;;
+        BootLoader) [ -n "$BOOTLOADER_DONE" ] ;;
+        Partition) [ -n "$PARTITIONS_DONE" ] ;;
+        Filesystems) [ -n "$FILESYSTEMS_DONE" ] ;;
+        Encryption) [ -n "$ENCRYPTION_DONE" ] ;;
+        GPUTest) true ;;
+        Install) [ -n "$INSTALL_DONE" ] ;;
+    esac
+}
+
+# The wording shown for a step; the step names themselves are internal.
+step_label() {
+    case "$1" in
+        Hostname) echo "Computer name" ;;
+        RootPassword) echo "Root password" ;;
+        UserAccount) echo "User account" ;;
+        BootLoader) echo "Boot loader" ;;
+        Filesystems) echo "File systems" ;;
+        GPUTest) echo "GPU test" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+step_clear() {
+    case "$1" in
+        Keyboard) KEYBOARD_DONE= ;;
+        Hostname) HOSTNAME_DONE= ;;
+        Locale) LOCALE_DONE= ;;
+        Timezone) TIMEZONE_DONE= ;;
+        RootPassword) ROOTPASSWORD_DONE= ;;
+        UserAccount) USERLOGIN_DONE= USERPASSWORD_DONE= USERGROUPS_DONE= USERACCOUNT_DONE= ;;
+        BootLoader) BOOTLOADER_DONE= ;;
+        Partition) PARTITIONS_DONE= ;;
+        Filesystems) FILESYSTEMS_DONE= ;;
+        Encryption) ENCRYPTION_DONE= ;;
+    esac
+}
+
+run_step() {
+    case "$1" in
+        Keyboard) menu_keymap ;;
+        Hostname) menu_hostname ;;
+        Locale) menu_locale ;;
+        Timezone) menu_timezone ;;
+        RootPassword) menu_rootpassword ;;
+        UserAccount) menu_useraccount ;;
+        BootLoader) menu_bootloader ;;
+        Partition) menu_partitions ;;
+        Filesystems) menu_filesystems ;;
+        Encryption) menu_encryption ;;
+        GPUTest) menu_gputest ;;
+        Install) menu_install ;;
+    esac
+}
+
+wizard() {
+    local i=0 n step
+    if xbps-uhelper arch | grep -qe '-musl$'; then
+        STEPS=("${STEPS[@]/Locale}")
+    fi
+    if is_macpro2013; then
+        STEPS=("${STEPS[@]/Install/GPUTest}" Install)
+    fi
+    n=${#STEPS[@]}
+    while [ $i -lt $n ]; do
+        step=${STEPS[$i]}
+        [ -n "$step" ] || { i=$((i + 1)); continue; }
+        TITLE="Step $((i + 1)) of $n: $(step_label "$step")"
+        step_clear "$step"
+        run_step "$step"
+        if step_done "$step"; then
+            i=$((i + 1))
+            continue
+        fi
+        case "$step" in
+            Install)
+                # The checks in Install name what is missing; back to the file systems.
+                for i in "${!STEPS[@]}"; do [ "${STEPS[$i]}" = Filesystems ] && break; done
+                continue
+                ;;
+        esac
+        if [ $i -eq 0 ]; then
+            DIALOG --yes-label "Abort" --no-label "Stay" --yesno "Abort the installation?" ${YESNOSIZE} && DIE
+        else
+            i=$((i - 1))
+        fi
+    done
+    DIE
+}
+
+if ! command -v dialog >/dev/null; then
+    echo "ERROR: missing dialog command, exiting..."
+    exit 1
+fi
+
+if [ "$(id -u)" != "0" ]; then
+   echo "wignix-installer must run as root" 1>&2
+   exit 1
+fi
+
+#
+# main()
+#
+DIALOG --title "${BOLD}${RED} Welcome to WigNix ${RESET}" --msgbox "\n
+A simple retro-future linux distribution built for the discerning user.\n\n" 9 76
+
+wizard
+
+exit 0
+# vim: set ts=4 sw=4 et:
